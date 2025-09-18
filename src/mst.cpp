@@ -82,6 +82,27 @@ std::vector<Edge> MSTIndex::Kruskal_MST(std::vector<Edge> edges, int num_nodes) 
     return result;
 }
 
+std::vector<Edge> MSTIndex::Kruskal_MST_wo_sort(std::vector<Edge> edges, int num_nodes)
+{
+    std::vector<Edge> result;
+
+    UnionFind uf(num_nodes);
+    uf.clear(num_nodes);
+
+    for (auto edge : edges) {
+        int u = edge.src_id;
+        int v = edge.dest_id;
+        int rootX, rootY;
+
+        if (!uf.connected(u, v, rootX, rootY)) {
+            result.push_back(edge);
+            uf.unite(rootX, rootY);
+        }
+    }
+
+    return result;
+}
+
 std::pair<std::vector<Edge>, std::vector<Edge>> MSTIndex::special_Kruskal_MST(std::vector<Edge> edges, int num_nodes) {
     std::vector<Edge> result;
     std::vector<Edge> invalid;
@@ -466,9 +487,296 @@ void MSTIndex::create_bl_idx_pro() {
         }
         cnt++;
     }
+    cached_total_seq = std::move(total_seq);
+    cached_basic_msts = std::move(basic_msts);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     std::cout << "bl index construction time (pro): " << (double)duration.count()/1000 << " ms" << std::endl;
+    print_peak_memory_usage();
+}
+
+void MSTIndex::update_bl_idx()
+{
+    auto basic_edges = graph_->get_temporal_edges(time_window_sz);
+    auto mst = Kruskal_MST(basic_edges, graph_->get_num_nodes());
+    int threshold = static_cast<int>(mst.size());
+    cached_basic_msts.resize(time_window_sz + 1);
+    for (int i = 0; i < mst.size(); i++)
+    {
+        cached_basic_msts[time_window_sz].push_back(i + cached_total_seq.size());
+    }
+
+    cached_total_seq = merge_sorted_edges(cached_total_seq, mst);
+
+    // ExpireTimeRecord vector
+    expired_seq.resize(cached_total_seq.size());
+
+    // Union
+    auto num_nodes = graph_->get_num_nodes();
+    DMST::DynamicMST dMST(num_nodes);
+    dMST.init();
+    std::unordered_map<DMST::Edge, int, DMST::EdgeHash> edgeMap;
+
+    int cnt_expired = 0;
+    for (auto &e_idx : cached_basic_msts[time_window_sz]) {
+        Edge edge = cached_total_seq[e_idx];
+        DMST::Edge removed_e;
+        dMST.insert_edge(edge.src_id, edge.dest_id, edge.weight, removed_e);
+        DMST::Edge added_edge(edge.src_id, edge.dest_id, edge.weight);
+        edgeMap[added_edge] = e_idx;
+    }
+
+    for (auto i = time_window_sz - 1; i >= 0; i--) {
+        for (auto &e_idx : cached_basic_msts[i]) {
+            Edge edge = cached_total_seq[e_idx];
+            DMST::Edge removed_e;
+
+            if (expired_seq[e_idx].back().first < i) {
+                auto res = dMST.insert_edge(edge.src_id, edge.dest_id, edge.weight, removed_e);
+                if (res == 1) { // fail
+                    expired_seq[e_idx].emplace_back(i, time_window_sz);
+                    if (cached_total_seq[e_idx].timestamp == time_window_sz) {
+                        cnt_expired++;
+                    }
+                } else if (res == 2) {
+                    if (removed_e.u > removed_e.v) { std::swap(removed_e.u, removed_e.v); }
+                    auto removed_e_idx = edgeMap[removed_e];
+                    DMST::Edge added_edge(edge.src_id, edge.dest_id, edge.weight);
+                    edgeMap[added_edge] = e_idx;
+                    if (expired_seq[removed_e_idx].empty()) {
+                        expired_seq[removed_e_idx].emplace_back(i, time_window_sz);
+                    }
+                    else if (expired_seq[removed_e_idx].back().first < i) {
+                        expired_seq[removed_e_idx].emplace_back(i, time_window_sz);
+                    }
+                    edgeMap.erase(removed_e);
+                    if (cached_total_seq[removed_e_idx].timestamp == time_window_sz) {
+                        cnt_expired++;
+                    }
+                } else {
+                    DMST::Edge added_edge(edge.src_id, edge.dest_id, edge.weight);
+                    edgeMap[added_edge] = e_idx;
+                }
+            }
+        }
+
+        if (i == 0) {
+            for (auto& e_idx : cached_basic_msts[time_window_sz]) {
+                if (expired_seq[e_idx].empty()) {
+                    expired_seq[e_idx].emplace_back(-1, i);
+                }
+            }
+        }
+
+        if (cnt_expired == threshold) {
+            break;
+        }
+    }
+
+    bl_keys_.resize(time_window_sz + 1);
+    bl_values_.resize(time_window_sz + 1);
+    for (auto i = 0; i < time_window_sz; i++) {
+        int cnt = 0;
+        for (auto &idx : cached_basic_msts[i]) {
+            bl_values_[i][cnt] = expired_seq[idx];
+            cnt++;
+        }
+    }
+    for (auto &idx : cached_basic_msts[time_window_sz])
+    {
+        bl_keys_[time_window_sz].push_back(cached_total_seq[idx]);
+        bl_values_[time_window_sz].push_back(expired_seq[idx]);
+    }
+    time_window_sz++;
+}
+
+void MSTIndex::create_bl_idx_pro_parallel(int num_threads) {
+    auto start = std::chrono::high_resolution_clock::now();
+
+    std::vector<Edge> total_seq;
+    std::vector<int> threshold;
+    std::vector<std::vector<Edge>> mst_cache(time_window_sz);
+    threshold.resize(time_window_sz);
+
+    BS::thread_pool pool(num_threads);
+
+    const BS::multi_future<void> loop_future = pool.submit_loop(0, time_window_sz,
+        [&](int i) {
+            auto basic_edges = graph_->get_temporal_edges(i);
+            mst_cache[i] = Kruskal_MST(basic_edges, graph_->get_num_nodes());
+            threshold[i] = static_cast<int>(mst_cache[i].size());
+        }
+    );
+
+    loop_future.wait();
+
+    for (int i = 0; i < time_window_sz; i++) {
+        if (i == 0) {
+            total_seq = std::move(mst_cache[i]);
+        } else {
+            total_seq.insert(total_seq.end(), mst_cache[i].begin(), mst_cache[i].end());
+        }
+    }
+    mst_cache.clear();
+
+    std::vector<std::vector<int>> basic_msts(time_window_sz);
+    {
+        int idx = 0;
+        for (auto &e : total_seq) {
+            basic_msts[e.timestamp].push_back(idx++);
+        }
+    }
+
+    expired_seq.clear();
+    expired_seq.resize(total_seq.size());
+    for (int idx : basic_msts[0]) {
+        expired_seq[idx].emplace_back(-1, 0);
+    }
+
+    auto num_nodes = graph_->get_num_nodes();
+
+    int batch_size = num_threads;
+
+    for (int i = 1; i < time_window_sz; i += batch_size) {
+        int task_begin = i;
+        int task_end = min(time_window_sz, i + batch_size);
+
+        std::vector<std::unordered_map<int, std::pair<bint, bint>>> record_cache(task_end - task_begin);
+        BS::multi_future<void> loop_compute;
+        loop_compute.reserve(task_end - task_begin);
+        for (int j = task_end - 1; j >= task_begin; j--)
+        {
+            loop_compute.push_back(pool.submit_task([&, j]
+            {
+                int local_id = (j - 1) % batch_size;
+
+                DMST::DynamicMST dMST(num_nodes);
+                dMST.init();
+                std::unordered_map<DMST::Edge, int, DMST::EdgeHash> edgeMap;
+
+                int cnt_expired = 0;
+                for (auto &e_idx : basic_msts[j]) {
+                    Edge edge = total_seq[e_idx];
+                    DMST::Edge removed_e;
+                    dMST.insert_edge(edge.src_id, edge.dest_id, edge.weight, removed_e);
+                    DMST::Edge added_edge(edge.src_id, edge.dest_id, edge.weight);
+                    edgeMap[added_edge] = e_idx;
+                }
+
+                for (auto k = j - 1; k >= 0; k--) {
+                    for (auto &e_idx : basic_msts[k]) {
+                        Edge edge = total_seq[e_idx];
+                        DMST::Edge removed_e;
+
+                        if (expired_seq[e_idx].empty() || expired_seq[e_idx].back().first < k) {
+                            auto res = dMST.insert_edge(edge.src_id, edge.dest_id, edge.weight, removed_e);
+                            if (res == 1) { // fail
+                                record_cache[local_id][e_idx] = {k, j};
+
+                                if (edge.timestamp == j) {
+                                    cnt_expired++;
+                                }
+                            } else if (res == 2) {
+                                if (removed_e.u > removed_e.v) { std::swap(removed_e.u, removed_e.v); }
+                                auto removed_e_idx = edgeMap[removed_e];
+
+                                record_cache[local_id][removed_e_idx] = {k, j};
+                                edgeMap.erase(removed_e);
+
+                                DMST::Edge added_edge(edge.src_id, edge.dest_id, edge.weight);
+                                edgeMap[added_edge] = e_idx;
+
+                                if (total_seq[removed_e_idx].timestamp == j) {
+                                    cnt_expired++;
+                                }
+                            } else {
+                                DMST::Edge added_edge(edge.src_id, edge.dest_id, edge.weight);
+                                edgeMap[added_edge] = e_idx;
+                            }
+                        }
+                    }
+
+                    if (k == 0) {
+                        for (auto &e_idx : basic_msts[j]) {
+                            if (!record_cache[local_id].count(e_idx)) {
+                                record_cache[local_id][e_idx] = {-1, j};
+                            }
+                        }
+                    }
+                    if (cnt_expired == threshold[j]) break;
+                }
+            }));
+        }
+
+        loop_compute.wait();
+
+        std::vector<std::vector<std::unordered_map<int, std::pair<bint, bint>>>> cache_split(
+            batch_size, std::vector<std::unordered_map<int, std::pair<bint, bint>>>(task_end - task_begin)
+        );
+
+        for (int j = 0; j < task_end - task_begin; j++) {
+            for (const auto& [key, val] : record_cache[j]) {
+                int tid = key % batch_size;
+                cache_split[tid][j][key] = val;
+            }
+        }
+
+        BS::multi_future<void> loop_update;
+        loop_update.reserve(batch_size);
+
+        int actual_batch_size = task_end - task_begin;
+        for (int j = 0; j < batch_size; j++)
+        {
+            loop_update.push_back(pool.submit_task([&, j, actual_batch_size]
+            {
+                for (int k = 0; k < actual_batch_size; k++)
+                {
+                    for (auto &p : cache_split[j][k])
+                    {
+                        int e_idx = p.first;
+                        if (expired_seq[e_idx].empty())
+                        {
+                            expired_seq[e_idx].emplace_back(p.second);
+                        } else
+                        {
+                            if (p.second.first < expired_seq[e_idx].back().first)
+                            {
+                                cerr << "violate lemma" << endl;
+                                exit(0);
+                            } else if (p.second.first > expired_seq[e_idx].back().first)
+                            {
+                                expired_seq[e_idx].emplace_back(p.second);
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        loop_update.wait();
+        cache_split.clear();
+        record_cache.clear();
+    }
+
+    bl_keys_.assign(time_window_sz, {});
+    bl_values_.assign(time_window_sz, {});
+
+    BS::multi_future<void> write;
+    for (int t = 0; t < time_window_sz; ++t) {
+        write.push_back(pool.submit_task([&, t]
+        {
+            for (int idx : basic_msts[t]) {
+                bl_keys_[t].push_back(total_seq[idx]);
+                bl_values_[t].push_back(expired_seq[idx]);
+            }
+        }));
+    }
+    write.wait();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto dur = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    std::cout << "bl index construction time (pro && parallel): "
+              << (double)dur.count() / 1000 << " ms" << std::endl;
     print_peak_memory_usage();
 }
 
@@ -761,6 +1069,138 @@ std::vector<std::vector<Edge>> MSTIndex::query_online(std::vector<TimeWindow> &t
     return msts;
 }
 
+std::vector<std::vector<Edge>> MSTIndex::query_online_global(std::vector<TimeWindow> &time_windows) const
+{
+    std::cout << "online query (global sorted list)..." << std::endl;
+
+    std::vector<std::vector<Edge>> msts;
+    int cnt = 0;
+    std::vector<Edge> global_list;
+    for (int i = 0; i < time_window_sz; i++)
+    {
+        std::vector<Edge> edges = graph_->get_temporal_edges(i);
+        global_list.insert(global_list.end(), edges.begin(), edges.end());
+    }
+
+    std::sort(global_list.begin(), global_list.end(), [](const Edge& a, const Edge& b) {
+        if (a.weight != b.weight) {
+            return a.weight < b.weight;
+        } else if (a.timestamp != b.timestamp) {
+            return a.timestamp > b.timestamp;
+        } else if (a.src_id != b.src_id) {
+            return a.src_id < b.src_id;
+        } else {
+            return a.dest_id < b.dest_id;
+        }
+    });
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (auto window : time_windows) {
+        if (cnt % 100 == 0) {
+            // std::cout << "the " << cnt << "th query" << std::endl;
+        }
+        std::vector<Edge> snapshot;
+        for (auto edge : global_list)
+        {
+            if (edge.timestamp >= window.first && edge.timestamp <= window.second)
+            {
+                snapshot.push_back(edge);
+            }
+        }
+        Kruskal_MST_wo_sort(snapshot, graph_->get_num_nodes());
+        //msts.emplace_back(Kruskal_MST(snapshot, graph_->get_num_nodes()));
+        cnt++;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    std::cout << "Average time: " << (double)duration.count()/1000/static_cast<double>(time_windows.size()) << " ms" << std::endl;
+
+    return msts;
+}
+
+std::vector<Edge> MSTIndex::k_way_merge(std::vector<std::vector<Edge>>& sorted_lists)
+{
+    using PQElement = std::pair<Edge, std::pair<int, int>>; // (edge, (list_idx, edge_idx))
+    auto cmp = [](const PQElement& a, const PQElement& b) {
+        return a.first.weight > b.first.weight;  // min-heap based on weight
+    };
+
+    std::priority_queue<PQElement, std::vector<PQElement>, decltype(cmp)> min_heap(cmp);
+    std::vector<Edge> merged_result;
+
+    // Initialize: push the first element of each list
+    for (int i = 0; i < sorted_lists.size(); ++i) {
+        if (!sorted_lists[i].empty()) {
+            min_heap.emplace(sorted_lists[i][0], std::make_pair(i, 0));
+        }
+    }
+
+    while (!min_heap.empty()) {
+        auto [edge, pos] = min_heap.top();
+        min_heap.pop();
+        merged_result.push_back(edge);
+
+        int list_idx = pos.first;
+        int edge_idx = pos.second;
+
+        // Push the next edge from the same list, if any
+        if (edge_idx + 1 < sorted_lists[list_idx].size()) {
+            min_heap.emplace(sorted_lists[list_idx][edge_idx + 1], std::make_pair(list_idx, edge_idx + 1));
+        }
+    }
+
+    return merged_result;
+}
+
+std::vector<std::vector<Edge>> MSTIndex::query_online_k_way(std::vector<TimeWindow> &time_windows)
+{
+    std::cout << "online query (k way)..." << std::endl;
+
+    std::vector<std::vector<Edge>> msts;
+    std::vector<std::vector<Edge>> basic_lists;
+    int cnt = 0;
+    for (int i = 0; i < time_window_sz; i++)
+    {
+        std::vector<Edge> edges = graph_->get_temporal_edges(i);
+        std::sort(edges.begin(), edges.end(), [](const Edge& a, const Edge& b) {
+            if (a.weight != b.weight) {
+                return a.weight < b.weight;
+            } else if (a.timestamp != b.timestamp) {
+                return a.timestamp > b.timestamp;
+            } else if (a.src_id != b.src_id) {
+                return a.src_id < b.src_id;
+            } else {
+                return a.dest_id < b.dest_id;
+            }
+        });
+        basic_lists.push_back(edges);
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (auto window : time_windows) {
+        if (cnt % 100 == 0) {
+            // std::cout << "the " << cnt << "th query" << std::endl;
+        }
+        std::vector<Edge> snapshot;
+        std::vector<std::vector<Edge>> k_lists;
+        for (auto i = window.first; i <= window.second; i++)
+        {
+            k_lists.push_back(basic_lists[i]);
+        }
+        snapshot = k_way_merge(k_lists);
+        Kruskal_MST_wo_sort(snapshot, graph_->get_num_nodes());
+        //msts.emplace_back(Kruskal_MST(snapshot, graph_->get_num_nodes()));
+        cnt++;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    std::cout << "Average time: " << (double)duration.count()/1000/static_cast<double>(time_windows.size()) << " ms" << std::endl;
+
+    return msts;
+}
+
 std::vector<std::vector<Edge>> MSTIndex::query_bl(std::vector<TimeWindow> &time_windows) {
     auto valid = [](ExpireTimeRecord record, bint t_begin, bint t_end) -> bool {
         if (record.back().second <= t_end) {
@@ -1004,6 +1444,30 @@ void MSTIndex::load_bl_idx(std::string &index_file) {
     load_nested_vector(file, bl_keys_);
     // bl_values_
     load_double_nested_vector(file, bl_values_);
+    time_window_sz = 2000;
+
+    auto s_size = 0;
+    for (auto i = 0; i < bl_keys_.size(); i++)
+    {
+        s_size += bl_keys_[i].size();
+    }
+
+    size_t t_size = 0;
+    for (auto i = 0; i < bl_values_.size(); i++) {
+        for (auto j = 0; j < bl_values_[i].size(); j++)
+        {
+            auto bl_value = bl_values_[i][j];
+            if (bl_value.back().first != i)
+            {
+                t_size += time_window_sz - i;
+            } else
+            {
+                t_size += bl_value.back().second - i;
+            }
+        }
+    }
+
+    std::cout << "t star is: " <<  (double)t_size/s_size << std::endl;
 
     file.close();
 }

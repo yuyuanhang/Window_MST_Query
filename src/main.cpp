@@ -10,6 +10,8 @@
 enum class CommandType {
     GenerateQuery,
     BuildIndex,
+    BuildIndexPara,
+    BuildIndexInc,
     ExecuteQuery,
     ValidateIndex,
     QTCount,
@@ -21,12 +23,12 @@ std::map<std::string, CommandType> commandMap = {
         {"-gq", CommandType::GenerateQuery},
         {"--build-index", CommandType::BuildIndex},
         {"-bi", CommandType::BuildIndex},
+        {"--build-index-parallel", CommandType::BuildIndexPara},
+        {"-bip", CommandType::BuildIndexPara},
+        {"--build-index-incremental", CommandType::BuildIndexInc},
+        {"-bii", CommandType::BuildIndexInc},
         {"--execute-query", CommandType::ExecuteQuery},
-        {"-eq", CommandType::ExecuteQuery},
-        {"--validate-index", CommandType::ValidateIndex},
-        {"-vi", CommandType::ValidateIndex},
-        {"--qt-count", CommandType::QTCount},
-        {"-qc", CommandType::QTCount}
+        {"-eq", CommandType::ExecuteQuery}
 };
 
 CommandType parseCommand(const std::string& cmd) {
@@ -38,14 +40,14 @@ CommandType parseCommand(const std::string& cmd) {
 
 void help() {
     std::cout << "Usage: [command] [options]" << std::endl;
-    std::cout << "--generate-query/-gq [output] [num_queries] [data graph] [window_ratio]" << std::endl;
-    std::cout << "--build-index/-bi [output] [data graph] [edge_ratio]" << std::endl;
-    std::cout << "--execute-query/-eq [output] [queries] [data graph] [index] [method_type]" << std::endl;
-    std::cout << "--validate-index/-vi [queries] [data graph] [index] [window_ratio]" << std::endl;
-    std::cout << "--qt-count/-qc [output] [data graph] [edge_ratio]" << std::endl;
+    std::cout << "--generate-query/-gq [data graph] [window_ratio] [num_queries] [query]" << std::endl;
+    std::cout << "--build-index/-bi [data graph] [method_type] [index]" << std::endl;
+    std::cout << "--execute-query/-eq [data graph] [query] [method_type] [index]" << std::endl;
+    std::cout << "--build-index-parallel/-bip [data graph] [num_thread] [index]" << std::endl;
+    std::cout << "--build-index-incremental/-bii [data graph] [edge_ratio]" << std::endl;
 }
 
-void generate_queries(int num_queries, std::string query, const std::string &tgraph, float window_ratio) {
+void generate_queries(const std::string &tgraph, const float window_ratio, const int num_queries, std::string query) {
     GraphIO graph_io(tgraph);
     // Read the graph data from file
     std::vector<Edge> edges = graph_io.read_graph();
@@ -57,7 +59,54 @@ void generate_queries(int num_queries, std::string query, const std::string &tgr
     window_generator.save_windows();
 }
 
-void build_index(const std::string &tgraph, std::string index, float edge_ratio) {
+void build_index(const std::string &tgraph, const std::string &type, const std::string &index) {
+    GraphIO graph_io(tgraph);
+    // Read the graph data from file
+    std::vector<Edge> edges = graph_io.read_graph();
+    TemporalGraph graph(edges);
+    // Modify the graph data
+    graph.group_edges_by_timestamp();
+    MSTIndex mst_index(&graph);
+
+    if (type == "base")
+    {
+        std::string bl_index(index+"_bl.bin");
+        mst_index.create_bl_idx_plus();
+        mst_index.save_bl_idx(bl_index);
+    } else if (type == "op")
+    {
+        std::string bl_index(index+"_bl.bin");
+        mst_index.create_bl_idx_pro();
+        mst_index.save_bl_idx(bl_index);
+    } else if (type == "d")
+    {
+        std::string d_index(index+"_d.bin");
+        mst_index.create_bl_idx_pro();
+        mst_index.create_qt_idx();
+        mst_index.save_qt_idx(d_index);
+    } else if (type == "b")
+    {
+        std::string b_index(index+"_b.bin");
+        mst_index.create_bl_idx_pro();
+        mst_index.create_hy_idx(true);
+        mst_index.save_hy_idx(b_index);
+    }
+}
+
+void build_index_para(const std::string &tgraph, const int num_threads, const std::string &index) {
+    GraphIO graph_io(tgraph);
+    // Read the graph data from file
+    std::vector<Edge> edges = graph_io.read_graph();
+    TemporalGraph graph(edges);
+    // Modify the graph data
+    graph.group_edges_by_timestamp();
+    MSTIndex mst_index(&graph);
+    std::string bl_index(index + "_bl_para_" + std::to_string(num_threads) + ".bin");
+    mst_index.create_bl_idx_pro_parallel(num_threads);
+    mst_index.save_bl_idx(bl_index);
+}
+
+void build_index_inc(const std::string &tgraph, const float edge_ratio) {
     GraphIO graph_io(tgraph);
     // Read the graph data from file
     std::vector<Edge> edges = graph_io.read_graph();
@@ -65,45 +114,28 @@ void build_index(const std::string &tgraph, std::string index, float edge_ratio)
     // Modify the graph data
     graph.group_edges_by_timestamp();
     MSTIndex mst_index(&graph);
-    //mst_index.create_bl_idx();
-    //mst_index.save_bl_idx(index);
-    std::string ratio;
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(1) << edge_ratio;
-    ratio = oss.str();
-    std::string bl_index(index+"_bl_"+ratio+".bin");
-    mst_index.create_bl_idx_plus();
-    /*mst_index.save_bl_idx(bl_index);
+    mst_index.time_window_sz = graph.nb_tbase;
+    auto start = std::chrono::high_resolution_clock::now();
+    std::chrono::microseconds delete_time(0);
+    mst_index.create_bl_idx_pro();
+    for (auto i = 0; i < graph.nb_tstream; i++)
+    {
+        mst_index.update_bl_idx();
+        mst_index.create_hy_idx(true);
 
-    std::string op_index(index+"_op_"+ratio+".bin");
-    mst_index.create_op_idx();
-    mst_index.save_op_idx(op_index);
-
-    std::string hy1_index(index+"_hy1_"+ratio+".bin");
-    mst_index.create_hy_idx(true);
-    mst_index.save_hy_idx(hy1_index);
-
-    std::string qt_index(index+"_qt_"+ratio+".bin");
-    mst_index.create_qt_idx();
-    mst_index.save_qt_idx(qt_index);*/
-
-    /*std::string hy0_index(index+"_hy0_"+ratio+".bin");
-    mst_index.create_hy_idx(false);
-    mst_index.save_hy_idx(hy0_index);*/
+        auto d0 = std::chrono::high_resolution_clock::now();
+        mst_index.delete_hy_idx();
+        auto d1 = std::chrono::high_resolution_clock::now();
+        delete_time += std::chrono::duration_cast<std::chrono::microseconds>(d1 - d0);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto dur = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    std::chrono::microseconds final_time = dur - delete_time;
+    std::cout << "bl index construction time (pro && inc): "
+              << (double)final_time.count() / 1000 << " ms" << std::endl;
 }
 
-void qt_count(const std::string &tgraph, std::string index, float edge_ratio) {
-    GraphIO graph_io(tgraph);
-    // Read the graph data from file
-    std::vector<Edge> edges = graph_io.read_graph();
-    TemporalGraph graph(edges, edge_ratio);
-    // Modify the graph data
-    graph.group_edges_by_timestamp();
-    MSTIndex mst_index(&graph);
-    mst_index.qt_idx_count(index);
-}
-
-void execute_queries(std::string query, const std::string &tgraph, std::string index, std::string ratio, const std::string &res) {
+void execute_queries(const std::string &tgraph, std::string query, const std::string &type, const std::string &index) {
     GraphIO graph_io(tgraph);
     // Read the graph data from file
     std::vector<Edge> edges = graph_io.read_graph();
@@ -115,38 +147,25 @@ void execute_queries(std::string query, const std::string &tgraph, std::string i
     window_generator.load_windows();
 
     MSTIndex mst_index(&graph);
-    /*mst_index.query_online(window_generator.windows_);
-    std::string bl_index(index+"_bl_"+ratio+".bin");
-    mst_index.load_bl_idx(bl_index);
-    mst_index.query_bl(window_generator.windows_);*/
-
-    std::string op_index(index+"_op_"+ratio+".bin");
-    mst_index.load_op_idx(op_index);
-    mst_index.query_op(window_generator.windows_);
-    
-    /*std::string qt_index(index+"_qt_"+ratio+".bin");
-    mst_index.load_qt_idx(qt_index);
-    mst_index.query_qt(window_generator.windows_);*/
-    
-    std::string hy1_index(index+"_hy1_"+ratio+".bin");
-    mst_index.load_hy_idx(hy1_index);
-    mst_index.query_hy(window_generator.windows_);
-}
-
-void validate_index(std::string query, const std::string &tgraph, std::string index, std::string ratio) {
-    GraphIO graph_io(tgraph);
-    // Read the graph data from file
-    std::vector<Edge> edges = graph_io.read_graph();
-    TemporalGraph graph(edges);
-    // Modify the graph data
-    graph.group_edges_by_timestamp();
-
-    TimeWindowGenerator window_generator(graph.get_num_timestamps(), query);
-    window_generator.load_windows();
-
-    MSTIndex mst_index(&graph);
-    
-    mst_index.validate(window_generator.windows_, index, ratio);
+    if (type == "online")
+    {
+        mst_index.query_online_global(window_generator.windows_);
+    } else if (type == "base")
+    {
+        std::string bl_index(index+"_bl.bin");
+        mst_index.load_bl_idx(bl_index);
+        mst_index.query_bl(window_generator.windows_);
+    } else if (type == "d")
+    {
+        std::string d_index(index+"_d.bin");
+        mst_index.load_qt_idx(d_index);
+        mst_index.query_qt(window_generator.windows_);
+    } else if (type == "b")
+    {
+        std::string b_index(index+"_b.bin");
+        mst_index.load_hy_idx(b_index);
+        mst_index.query_hy(window_generator.windows_);
+    }
 }
 
 int main(int argc, char* argv[])
@@ -158,91 +177,49 @@ int main(int argc, char* argv[])
         case CommandType::GenerateQuery: {
             std::cout << "Generating query..." << std::endl;
             if (argc < 6) { help(); return 0; }
-            std::string query = std::string(argv[2]);
-            int num_queries;
-            try {
-                num_queries = std::stoi(argv[3]);
-            } catch (const std::invalid_argument &e) {
-                std::cerr << "Invalid number: " << argv[3] << std::endl;
-            } catch (const std::out_of_range &e) {
-                std::cerr << "Number out of range: " << argv[3] << std::endl;
-            }
-            std::string tgraph = std::string(argv[4]);
-            float window_ratio;
-            try {
-                window_ratio = std::stof(argv[5]);
-            } catch (const std::invalid_argument &e) {
-                std::cerr << "Invalid number: " << argv[5] << std::endl;
-            } catch (const std::out_of_range &e) {
-                std::cerr << "Number out of range: " << argv[5] << std::endl;
-            }
-            generate_queries(num_queries, query, tgraph, window_ratio);
+            std::string tgraph = std::string(argv[2]);
+            float window_ratio = std::stof(argv[3]);
+            int num_queries = std::stoi(argv[4]);
+            std::string query = std::string(argv[5]);
+
+            generate_queries(tgraph, window_ratio, num_queries, query);
             break;
         }
         case CommandType::BuildIndex: {
             std::cout << "Building index..." << std::endl;
             if (argc < 5) { help(); return 0; }
-            std::string index = std::string(argv[2]);
-            std::string tgraph = std::string(argv[3]);
-            float edge_ratio;
-            try {
-                edge_ratio = std::stof(argv[4]);
-            } catch (const std::invalid_argument &e) {
-                std::cerr << "Invalid number: " << argv[4] << std::endl;
-            } catch (const std::out_of_range &e) {
-                std::cerr << "Number out of range: " << argv[4] << std::endl;
-            }
-            build_index(tgraph, index, edge_ratio);
+            std::string tgraph = std::string(argv[2]);
+            std::string type = std::string(argv[3]);
+            std::string index = std::string(argv[4]);
+            build_index(tgraph, type, index);
+            break;
+        }
+        case CommandType::BuildIndexPara: {
+            std::cout << "Building index in parallel..." << std::endl;
+            if (argc < 5) { help(); return 0; }
+            std::string tgraph = std::string(argv[2]);
+            int num_threads = std::stoi(argv[3]);
+            std::string index = std::string(argv[4]);
+            build_index_para(tgraph, num_threads, index);
+            break;
+        }
+        case CommandType::BuildIndexInc: {
+            std::cout << "Updating index..." << std::endl;
+            if (argc < 4) { help(); return 0; }
+            std::string tgraph = std::string(argv[2]);
+            float edge_ratio = std::stof(argv[3]);
+            build_index_inc(tgraph, edge_ratio);
             break;
         }
         case CommandType::ExecuteQuery: {
             std::cout << "Executing query..." << std::endl;
-            if (argc < 5) {
-                help();
-                return 0;
-            }
-            std::string res = std::string(argv[2]);
+            if (argc < 6) { help(); return 0; }
+            std::string tgraph = std::string(argv[2]);
             std::string query = std::string(argv[3]);
-            std::string tgraph = std::string(argv[4]);
-            std::string index;
-            std::string ratio;
-            if (argc == 7) {
-                index = std::string(argv[5]);
-                ratio = std::string(argv[6]);
-            }
-            execute_queries(query, tgraph, index, ratio, res);
-            break;
-        }
-        case CommandType::ValidateIndex: {
-            std::cout << "Validating index..." << std::endl;
-            if (argc < 6) {
-                help();
-                return 0;
-            }
-            std::string query = std::string(argv[2]);
-            std::string tgraph = std::string(argv[3]);
-            std::string index = std::string(argv[4]);
-            std::string edge_ratio = std::string(argv[5]);
-            validate_index(query, tgraph, index, edge_ratio);
-            break;
-        }
-        case CommandType::QTCount: {
-            std::cout << "counting quad-tree statistics..." << std::endl;
-            if (argc < 5) {
-                help();
-                return 0;
-            }
-            std::string index = std::string(argv[2]);
-            std::string tgraph = std::string(argv[3]);
-            float edge_ratio;
-            try {
-                edge_ratio = std::stof(argv[4]);
-            } catch (const std::invalid_argument &e) {
-                std::cerr << "Invalid number: " << argv[4] << std::endl;
-            } catch (const std::out_of_range &e) {
-                std::cerr << "Number out of range: " << argv[4] << std::endl;
-            }
-            qt_count(tgraph, index, edge_ratio);
+            std::string type = std::string(argv[4]);
+            std::string index = std::string(argv[5]);
+
+            execute_queries(tgraph, query, type, index);
             break;
         }
         default: {

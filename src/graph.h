@@ -8,6 +8,8 @@
 
 class TemporalGraph {
 public:
+    int nb_tbase;
+    int nb_tstream;
     explicit TemporalGraph(const std::vector<Edge>& temporal_edges, float edge_ratio = 1);
 
     void group_edges_by_timestamp();

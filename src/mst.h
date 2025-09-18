@@ -8,6 +8,7 @@
 #include "window_generator.h"
 #include "hybrid.h"
 #include "dynamic_mst.h"
+#include "BS_thread_pool.hpp"
 #include <vector>
 #include <map>
 #include <unordered_map>
@@ -36,22 +37,30 @@ public:
     std::vector<std::vector<std::vector<std::vector<std::vector<Edge>>>>> op_values_;
     std::unique_ptr<QuadTree> qt_idx_;
     std::unique_ptr<SegmentTree> hy_idx_;
+    std::vector<Edge> cached_total_seq;
+    std::vector<std::vector<int>> cached_basic_msts;
 
     explicit MSTIndex(TemporalGraph* graph) {
         graph_ = graph;
         time_window_sz = graph->get_num_timestamps();
     }
     static std::vector<Edge> Kruskal_MST(std::vector<Edge> edges, int num_nodes);
+    static std::vector<Edge> Kruskal_MST_wo_sort(std::vector<Edge> edges, int num_nodes);
     static std::pair<std::vector<Edge>, std::vector<Edge>> special_Kruskal_MST(std::vector<Edge> edges, int num_nodes);
     void create_bl_idx();
     void merge(const std::vector<int>& nums1, const std::vector<int>& nums2, std::vector<int> &result);
     void create_bl_idx_plus();
     void create_bl_idx_pro();
+    void update_bl_idx();
+    void create_bl_idx_pro_parallel(int num_threads);
     void create_op_idx();
     void create_qt_idx();
     void create_hy_idx(bool xFirst);
     void qt_idx_count(std::string &index_file);
     std::vector<std::vector<Edge>> query_online(std::vector<TimeWindow> &time_windows) const;
+    std::vector<std::vector<Edge>> query_online_global(std::vector<TimeWindow> &time_windows) const;
+    std::vector<Edge> k_way_merge(std::vector<std::vector<Edge>>& sorted_lists);
+    std::vector<std::vector<Edge>> query_online_k_way(std::vector<TimeWindow> &time_windows);
     std::vector<std::vector<Edge>> query_bl(std::vector<TimeWindow> &time_windows);
     std::vector<std::vector<Edge>> query_op(std::vector<TimeWindow> &time_windows);
     std::vector<std::vector<Edge>> query_qt(std::vector<TimeWindow> &time_windows);

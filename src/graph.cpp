@@ -10,9 +10,6 @@ TemporalGraph::TemporalGraph(const std::vector<Edge>& temporal_edges, float edge
         return a.timestamp < b.timestamp;
     });
 
-    size_t original_size = edges_.size();
-    auto num_elements_to_copy = static_cast<size_t>(std::ceil(static_cast<double>(original_size) * edge_ratio));
-    edges_ = std::vector<Edge>(edges_.begin(), edges_.begin() + num_elements_to_copy);
     num_edges_ = static_cast<bint>(edges_.size());
 
     num_nodes_ = 0;
@@ -24,8 +21,11 @@ TemporalGraph::TemporalGraph(const std::vector<Edge>& temporal_edges, float edge
         if (edge.dest_id >= num_nodes_) {
             num_nodes_ = edge.dest_id + 1;
         }
-        if (edge.timestamp >= num_timestamps_) { num_timestamps_ = edge.timestamp+1; }
+        if (edge.timestamp >= num_timestamps_) { num_timestamps_ = edge.timestamp + 1; }
     }
+
+    nb_tbase = static_cast<float>(num_timestamps_) * edge_ratio;
+    nb_tstream = num_timestamps_ - nb_tbase;
 
     std::cout << "|V|: " << num_nodes_ << std::endl;
     std::cout << "|E|: " << num_edges_ << std::endl;
