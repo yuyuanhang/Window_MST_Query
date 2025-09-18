@@ -13,8 +13,6 @@ enum class CommandType {
     BuildIndexPara,
     BuildIndexInc,
     ExecuteQuery,
-    ValidateIndex,
-    QTCount,
     Unknown
 };
 
